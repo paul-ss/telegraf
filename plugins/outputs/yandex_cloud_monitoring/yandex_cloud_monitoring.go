@@ -3,11 +3,15 @@ package yandex_cloud_monitoring
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/influxdata/telegraf"
@@ -26,12 +30,13 @@ type YandexCloudMonitoring struct {
 	Timeout     config.Duration `toml:"timeout"`
 	EndpointURL string          `toml:"endpoint_url"`
 	Service     string          `toml:"service"`
+	CAPath      string          `toml:"ca_path"`
 
 	Log telegraf.Logger
 
-	MetadataTokenURL       string
+	MetadataTokenURL       string `toml:"metadata_token_url"`
 	MetadataFolderURL      string
-	FolderID               string
+	FolderID               string `toml:"folder_id"`
 	IAMToken               string
 	IamTokenExpirationTime time.Time
 
@@ -92,17 +97,27 @@ func (a *YandexCloudMonitoring) Connect() error {
 		a.MetadataFolderURL = defaultMetadataFolderURL
 	}
 
+	tlsConf, err := commonTLSConfig(a.CAPath)
+	if err != nil {
+		a.Log.Errorf("Connect: error while fetching TLS config: %s", err)
+		return err
+	}
+
 	a.client = &http.Client{
 		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
+			Proxy:           http.ProxyFromEnvironment,
+			TLSClientConfig: tlsConf,
 		},
 		Timeout: time.Duration(a.Timeout),
 	}
 
-	var err error
-	a.FolderID, err = a.getFolderIDFromMetadata()
-	if err != nil {
-		return err
+	if a.FolderID == "" {
+		var err error
+		a.Log.Info("Folder id was not specified, trying to get it from metadata")
+		a.FolderID, err = a.getFolderIDFromMetadata()
+		if err != nil {
+			return err
+		}
 	}
 
 	a.Log.Infof("Writing to Yandex.Cloud Monitoring URL: %s", a.EndpointURL)
@@ -123,23 +138,10 @@ func (a *YandexCloudMonitoring) Close() error {
 func (a *YandexCloudMonitoring) Write(metrics []telegraf.Metric) error {
 	var yandexCloudMonitoringMetrics []yandexCloudMonitoringMetric
 	for _, m := range metrics {
-		for _, field := range m.FieldList() {
-			value, err := internal.ToFloat64(field.Value)
-			if err != nil {
-				a.Log.Errorf("Skipping value: %v", err)
-				continue
-			}
-
-			yandexCloudMonitoringMetrics = append(
-				yandexCloudMonitoringMetrics,
-				yandexCloudMonitoringMetric{
-					Name:   field.Key,
-					Labels: m.Tags(),
-					TS:     m.Time().Format(time.RFC3339),
-					Value:  value,
-				},
-			)
-		}
+		yandexCloudMonitoringMetrics = append(
+			yandexCloudMonitoringMetrics,
+			a.processMetric(m)...,
+		)
 	}
 
 	var body []byte
@@ -154,6 +156,85 @@ func (a *YandexCloudMonitoring) Write(metrics []telegraf.Metric) error {
 	}
 	body = append(jsonBytes, '\n')
 	return a.send(body)
+}
+
+func (a *YandexCloudMonitoring) processMetric(tgMetric telegraf.Metric) []yandexCloudMonitoringMetric {
+	name := tgMetric.Name()
+	metricType := tgMetricTypeToMonitoring(tgMetric.Type())
+	ts := tgMetric.Time().Format(time.RFC3339)
+
+	tags := make(map[string]string)
+	for _, tag := range tgMetric.TagList() {
+		tags[processName(tag.Key)] = tag.Value
+	}
+
+	useMetricName := len(tgMetric.FieldList()) == 1
+	var res []yandexCloudMonitoringMetric
+	for _, field := range tgMetric.FieldList() {
+		value, err := internal.ToFloat64(field.Value)
+		if err != nil {
+			a.Log.Errorf("Skipping value: %v", err)
+			continue
+		}
+
+		tgMetric.Type()
+
+		res = append(res, yandexCloudMonitoringMetric{
+			Name:       getMetricName(name, field.Key, useMetricName),
+			Labels:     tags,
+			MetricType: metricType,
+			TS:         ts,
+			Value:      value,
+		})
+	}
+
+	return res
+}
+
+func getMetricName(metricName, fieldName string, useMetricName bool) (name string) {
+	if metricName == "" {
+		name = fieldName
+	} else if useMetricName {
+		name = metricName
+	} else {
+		name = fmt.Sprintf("%s.%s", metricName, fieldName)
+	}
+
+	return processName(name)
+}
+
+func processName(name string) string {
+	return strings.ReplaceAll(name, " ", "_")
+}
+
+func tgMetricTypeToMonitoring(t telegraf.ValueType) string {
+	switch t {
+	case telegraf.Counter, telegraf.Histogram:
+		return "COUNTER"
+	default:
+		return "DGAUGE"
+	}
+}
+
+func commonTLSConfig(caPath string) (*tls.Config, error) {
+	if caPath == "" {
+		return &tls.Config{}, nil
+	}
+
+	rootCAs, err := x509.SystemCertPool()
+	if err != nil {
+		rootCAs = x509.NewCertPool()
+	}
+
+	pemData, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, err
+	}
+	rootCAs.AppendCertsFromPEM(pemData)
+	return &tls.Config{
+		MinVersion: tls.VersionTLS10,
+		RootCAs:    rootCAs,
+	}, nil
 }
 
 func getResponseFromMetadata(c *http.Client, metadataURL string) ([]byte, error) {
